@@ -1,81 +1,259 @@
+// Includes
+#include <ArduinoJson.h>
 #include "DHT.h"
+#include <fs.h>
 #include <ESP8266WiFi.h>
 #include "ThingSpeak.h"
-#include <Wire.h> 
-#include <WiFiClientSecure.h>
-#define DHTPIN 12 // IMPORTANT D2 on NodeMCU is GPIO 4
+#include <Wire.h>
+#define DHTPIN 12    // IMPORTANT D2 on NodeMCU is GPIO 4
 #include "SSD1306.h" // alias for `#include "SSD1306Wire.h"`
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-SSD1306  display(0x3c, 4, 5); // Initialise the OLED display using Wire library
-int localHum = 0;
-int localTemp = 0;
-int rssi = 0;
+#include <WiFiManager.h>
+
+// Defintions
+#define JSON_CONFIG_FILE "tempsettings.json"
 
 // Uncomment whatever type you're using!
 #define DHTTYPE DHT11 // DHT 11
 //#define DHTTYPE DHT22 // DHT 22 (AM2302), AM2321
 //#define DHTTYPE DHT21 // DHT 21 (AM2301)
 
-const char *ssid = "YOUR_SSID"; // Your wifi ssid
-const char *password = "YOUR_PASSWORD"; //Your wifi password
+// Global variables
+bool shouldSaveConfig = true;
+char apiKey[50] = "API KEY";
+int chanNum = 1234;
+int localHum = 0;
+int localTemp = 0;
+int rssi = 0;
+const char *server = "api.thingspeak.com";
 
-unsigned long myChannelNumber = YOUR_CHANNEL_NUMBER;
-const char * myWriteAPIKey = "YOUR_API_KEY";
+// Temp Sensor Initialize
+DHT dht(DHTPIN, DHTTYPE);
 
-const char* server = "api.thingspeak.com";
+// Display Initialize
+SSD1306 display(0x3c, 4, 5); // Initialise the OLED display using Wire library
 
+// WiFi Client Initialize
 WiFiClient client;
 
-DHT dht(DHTPIN, DHTTYPE);
-void updateThingSpeak(float t, float h){
-    ThingSpeak.setField(1,t);
-    ThingSpeak.setField(2,h);
-    ThingSpeak.writeFields(myChannelNumber,myWriteAPIKey);
-    delay(20*1000);
-}
+// WiFi Manager Initialize
+WiFiManager wm;
+
+// Setup Function
 
 void setup()
 {
-    // put your setup code here, to run once:
+
     int x=0;
     int y=0;
-    Serial.begin(115200);
+
     dht.begin();
     ThingSpeak.begin(client);
-    WiFi.begin(ssid, password);
-    
+
+    // display
     display.init();
     display.flipScreenVertically();
     display.clear();
-    display.drawString(0 + x, 0 + y, "Connecting to WiFi...");
+    display.drawString(0 + x, 0 + y, "Connect to");
+    display.drawString(0 + x, 15 + y, "'TempSensorSetup' for");
+    display.drawString(0 + x, 30 + y, "configuration");
+    display.drawString(0 + x, 45 + y, "at '192.168.4.1'");
     display.display();
-    
-    Serial.print("...Connecting to wifi...");
-    while (WiFi.status() != WL_CONNECTED) {
-      Serial.print(".");
-      delay(2000);
+  
+  // Change to true when testing to force configuration every time we run
+  bool forceConfig = false;
+ 
+  bool spiffsSetup = loadConfigFile();
+  if (!spiffsSetup)
+  {
+    Serial.println(F("Forcing config mode as there is no saved config"));
+    forceConfig = true;
+  }
+ 
+  // Explicitly set WiFi mode
+  WiFi.mode(WIFI_STA);
+ 
+  // Setup Serial monitor
+  Serial.begin(115200);
+  delay(10);
+ 
+  // Reset settings (only for development)
+  //wm.resetSettings();
+ 
+  // Set config save notify callback
+  wm.setSaveConfigCallback(saveConfigCallback);
+ 
+  // Set callback that gets called when connecting to previous WiFi fails, and enters Access Point mode
+  wm.setAPCallback(configModeCallback);
+ 
+  // Custom elements
+ 
+  // Text box (String) - 50 characters maximum
+  WiFiManagerParameter api_key_text_box("key_text", "Enter your API Key", apiKey, 50);
+  
+  // Need to convert numerical input to string to display the default value.
+  char convertedValue[30];
+  sprintf(convertedValue, "%d", chanNum); 
+  
+  // Text box (Number) - 30 characters maximum
+  WiFiManagerParameter chan_num_text_box("key_num", "Enter your channel number", convertedValue, 30); 
+ 
+  // Add all defined parameters
+  wm.addParameter(&api_key_text_box);
+  wm.addParameter(&chan_num_text_box);
+ 
+  if (forceConfig)
+    // Run if we need a configuration
+  {
+    if (!wm.startConfigPortal("TempSensorSetup", "password"))
+    {
+      Serial.println("failed to connect and hit timeout");
+      delay(3000);
+      //reset and try again, or maybe put it to deep sleep
+      ESP.restart();
+      delay(5000);
     }
-    Serial.println("");
-    Serial.println("WiFi connected");
-    Serial.println("IP address: ");
-    Serial.println(WiFi.localIP());
-    
-   
+  }
+  else
+  {
+    if (!wm.autoConnect("TempSensorSetup", "password"))
+    {
+      Serial.println("failed to connect and hit timeout");
+      delay(3000);
+      // if we still have not connected restart and try all over again
+      ESP.restart();
+      delay(5000);
+    }
+  }
+ 
+  // If we get here, we are connected to the WiFi
+ 
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+ 
+  // Lets deal with the user config values
+ 
+  // Copy the string value
+  strncpy(apiKey, api_key_text_box.getValue(), sizeof(apiKey));
+  Serial.print("API KEY: ");
+  Serial.println(apiKey);
+ 
+  //Convert the number value
+  chanNum = atoi(chan_num_text_box.getValue());
+  Serial.print("Channel Number: ");
+  Serial.println(chanNum);
+ 
+ 
+  // Save the custom parameters to FS
+  if (shouldSaveConfig)
+  {
+    saveConfigFile();
+  }
+}
+
+// Functions
+
+// JSON SAVE
+void saveConfigFile()
+{
+  Serial.println("Saving Configuration...");
+
+  StaticJsonDocument<512> json;
+  json["apiKey"] = apiKey;
+  json["chanNum"] = chanNum;
+
+  File configFile = SPIFFS.open(JSON_CONFIG_FILE, "w");
+  if (!configFile)
+  {
+    Serial.println("Failed to open config file!");
+  }
+
+  serializeJsonPretty(json, Serial);
+  if (serializeJson(json, configFile) == 0)
+  {
+    Serial.println(F("Failed to write to file"));
+  }
+  configFile.close();
+}
+
+// JSON LOAD
+bool loadConfigFile()
+{
+  Serial.println("Mounting the FS");
+
+  if (SPIFFS.begin())
+  {
+    Serial.println("Mounted the FS");
+    if (SPIFFS.exists(JSON_CONFIG_FILE))
+    {
+      Serial.println("Reading Config");
+      File configFile = SPIFFS.open(JSON_CONFIG_FILE, "r");
+      if (configFile)
+      {
+        Serial.println("Openend!");
+        StaticJsonDocument<512> json;
+        DeserializationError error = deserializeJson(json, configFile);
+        serializeJsonPretty(json, Serial);
+        if (!error)
+        {
+          Serial.println("Parsing the JSON");
+
+          strcpy(apiKey, json["apiKey"]);
+          chanNum = json["chanNum"].as<int>();
+
+          return true;
+        }
+        else
+        {
+          Serial.println("Failed to load json Config");
+        }
+      }
+    }
+  }
+  else
+  {
+    Serial.println("Failed to mount FS");
+  }
+
+  return false;
+}
+
+void saveConfigCallback()
+{
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
+
+void configModeCallback(WiFiManager *myWiFiManager)
+{
+  Serial.println("Entered Configuration Mode");
+
+  Serial.print("Config SSID: ");
+  Serial.println(myWiFiManager->getConfigPortalSSID());
+
+  Serial.print("Config IP Address: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void updateThingSpeak(float t, float h)
+{
+  ThingSpeak.setField(1, t);
+  ThingSpeak.setField(2, h);
+  ThingSpeak.writeFields(chanNum, apiKey);
+  delay(20 * 1000);
 }
 
 void loop()
 {
   getDHT();
   display.clear();
-  drawDHT(); 
+  drawDHT();
   getRSSI();
   display.display();
-  delay (2000);
-//  if(localTemp > 80)
-// {
-//   post();
-//  }
+  delay(2000);
 }
 
 void getDHT()
@@ -84,49 +262,50 @@ void getDHT()
   float humIni = localHum;
   localTemp = dht.readTemperature(true);
   localHum = dht.readHumidity();
-  if (isnan(localHum) || isnan(localTemp))   // Check if any reads failed and exit early (to try again).
+  if (isnan(localHum) || isnan(localTemp)) // Check if any reads failed and exit early (to try again).
   {
     Serial.println("Failed to read from DHT sensor!");
     localTemp = tempIni;
     localHum = humIni;
     return;
+  }
+
+  // Compute heat index in Fahrenheit (the default)
+  float hif = dht.computeHeatIndex(localTemp, localHum);
+
+  Serial.print("Humidity: ");
+  Serial.print(localHum);
+  Serial.print(" %\t");
+  Serial.print("Temperature: ");
+  Serial.print(localTemp);
+  Serial.print(" *F\t");
+  Serial.print("Heat index: ");
+  Serial.print(hif);
+  Serial.println(" *F");
+
+  if (client.connect(server, 80))
+  {
+    updateThingSpeak(localTemp, localHum);
+  }
 }
 
-    // Compute heat index in Fahrenheit (the default)
-    float hif = dht.computeHeatIndex(localTemp, localHum);
-
-    Serial.print("Humidity: ");
-    Serial.print(localHum);
-    Serial.print(" %\t");
-    Serial.print("Temperature: ");
-    Serial.print(localTemp);
-    Serial.print(" *F\t");
-    Serial.print("Heat index: ");
-    Serial.print(hif);
-    Serial.println(" *F");
-
-        if(client.connect(server,80)){
-        updateThingSpeak(localTemp,localHum);
-    }
-}
-
-void drawDHT() 
+void drawDHT()
 {
-  int x=0;
-  int y=0;
+  int x = 0;
+  int y = 0;
 
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.drawString(0 + x, 40 + y, "WiFi Signal Strength: ");
-  
+
   display.setFont(ArialMT_Plain_10);
   String myrssi = String(rssi) + "%";
   display.drawString(102 + x, 40 + y, myrssi);
-  
+
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.drawString(0 + x, 0 + y, "Hum");
-  
+
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.drawString(40 + x, y, "SERVERS");
@@ -138,7 +317,7 @@ void drawDHT()
 
   display.setFont(ArialMT_Plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.drawString(100 + x, 0  + y, "Temp");
+  display.drawString(100 + x, 0 + y, "Temp");
 
   display.setFont(ArialMT_Plain_24);
   String temp = String(localTemp) + "°F";
@@ -146,7 +325,7 @@ void drawDHT()
   int tempWidth = display.getStringWidth(temp);
 
   display.setFont(ArialMT_Plain_10);
-  display.drawString(20 + x, 52 + y, "595 Server Room");
+  display.drawString(20 + x, 52 + y, "595");
 }
 
 void getRSSI()
